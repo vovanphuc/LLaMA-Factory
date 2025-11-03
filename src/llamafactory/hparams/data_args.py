@@ -123,6 +123,16 @@ class DataArguments:
         default=True,
         metadata={"help": "Whether or not to enable thinking mode for reasoning models."},
     )
+    mask_thinking_loss: Optional[bool] = field(
+        default=False,
+        metadata={
+            "help": (
+                "Whether to mask thinking tokens from loss computation while keeping them visible. "
+                "Only effective when enable_thinking=True. When True, thinking tokens remain in "
+                "the output sequence but get IGNORE_INDEX labels for loss masking."
+            )
+        },
+    )
     tokenized_path: Optional[str] = field(
         default=None,
         metadata={

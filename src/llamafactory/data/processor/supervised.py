@@ -72,6 +72,95 @@ class SupervisedDatasetProcessor(DatasetProcessor):
             else:
                 target_label = target_ids
 
+            # Mask thinking tokens if requested
+            if (self.data_args.enable_thinking and
+                self.data_args.mask_thinking_loss and
+                hasattr(self.template, 'thought_words')):
+                target_label = self._mask_thinking_tokens(target_ids, target_label)
+
+                # Debug: Show word-by-word masking
+                print("\n" + "="*80)
+                print("DEBUG: Word-by-Word Masking Analysis")
+                print("="*80)
+                for idx, (token_id, label_id) in enumerate(zip(target_ids, target_label)):
+                    token_text = self.tokenizer.decode([token_id], skip_special_tokens=False)
+                    is_masked = (label_id == IGNORE_INDEX)
+                    status = "🚫 MASKED" if is_masked else "✅ LOSS"
+                    print(f"[{idx:3d}] {repr(token_text):30s} → {status}")
+
+                masked_count = sum(1 for l in target_label if l == IGNORE_INDEX)
+                loss_count = len(target_label) - masked_count
+                print(f"\n📊 Summary: {masked_count} masked, {loss_count} with loss (Total: {len(target_label)})")
+                print("="*80 + "\n")
+
+                # Debug: Visual side-by-side comparison
+                print("="*80)
+                print("DEBUG: Visual Comparison (Input IDs vs Labels)")
+                print("="*80)
+
+                # Create visual representation
+                token_texts = [self.tokenizer.decode([tid], skip_special_tokens=False) for tid in target_ids]
+
+                # Find contiguous masked and loss regions
+                regions = []
+                current_masked = (target_label[0] == IGNORE_INDEX)
+                region_start = 0
+
+                for i in range(1, len(target_label)):
+                    is_masked = (target_label[i] == IGNORE_INDEX)
+                    if is_masked != current_masked:
+                        regions.append((region_start, i, current_masked))
+                        region_start = i
+                        current_masked = is_masked
+                # Add final region
+                regions.append((region_start, len(target_label), current_masked))
+
+                # Print input_ids line
+                print("input_ids:  [", end="")
+                for i, token_text in enumerate(token_texts):
+                    if i > 0:
+                        print(", ", end="")
+                    # Truncate long tokens
+                    display_text = token_text.replace('\n', '\\n').replace('\t', '\\t')
+                    if len(display_text) > 15:
+                        display_text = display_text[:12] + "..."
+                    print(f"{display_text}", end="")
+                print("]")
+
+                # Print labels line
+                print("labels:     [", end="")
+                for i, (token_id, label_id) in enumerate(zip(target_ids, target_label)):
+                    if i > 0:
+                        print(", ", end="")
+                    if label_id == IGNORE_INDEX:
+                        print("-100", end="")
+                    else:
+                        token_text = self.tokenizer.decode([label_id], skip_special_tokens=False)
+                        display_text = token_text.replace('\n', '\\n').replace('\t', '\\t')
+                        if len(display_text) > 15:
+                            display_text = display_text[:12] + "..."
+                        print(f"{display_text}", end="")
+                print("]")
+
+                # Print visual indicators
+                print("            ", end="")
+                for start, end, is_masked in regions:
+                    region_len = sum(len(str(token_texts[i])) for i in range(start, end))
+                    region_len += (end - start - 1) * 2  # commas and spaces
+                    if start == 0:
+                        region_len += 1  # opening bracket
+                    else:
+                        region_len += 2  # comma and space before region
+
+                    if is_masked:
+                        print("^" * min(region_len, 50), end="")
+                        print(" NO LOSS ", end="")
+                    else:
+                        print("^" * min(region_len, 50), end="")
+                        print(" LOSS ", end="")
+                print()
+                print("="*80 + "\n")
+
             if self.data_args.mask_history:  # reversed sequences
                 input_ids = source_ids + target_ids + input_ids
                 labels = source_label + target_label + labels
@@ -120,6 +209,113 @@ class SupervisedDatasetProcessor(DatasetProcessor):
         print("inputs:\n{}".format(self.tokenizer.decode(example["input_ids"], skip_special_tokens=False)))
         print("label_ids:\n{}".format(example["labels"]))
         print(f"labels:\n{self.tokenizer.decode(valid_labels, skip_special_tokens=False)}")
+
+    def _mask_thinking_tokens(
+        self,
+        target_ids: list[int],
+        target_label: list[int]
+    ) -> list[int]:
+        """
+        Mask thinking tokens in target_label with IGNORE_INDEX.
+
+        This method identifies thinking tokens (enclosed in <think>...</think> tags)
+        in the target sequence and replaces their labels with IGNORE_INDEX, effectively
+        excluding them from loss computation while keeping them visible in the output.
+
+        Args:
+            target_ids: List of token IDs in the target sequence
+            target_label: List of label IDs (initially a copy of target_ids)
+
+        Returns:
+            Modified target_label with thinking tokens masked (set to IGNORE_INDEX)
+        """
+        # Get thinking tag strings from template
+        # Strip newlines as they may be normalized during processing
+        think_start_tag = self.template.thought_words[0].strip()
+        think_end_tag = self.template.thought_words[1].strip()
+
+        # Debug: Show what we're looking for
+        print("\n" + "="*80)
+        print("DEBUG: Thinking Tag Patterns")
+        print("="*80)
+        print(f"Start tag: {repr(think_start_tag)}")
+        print(f"End tag:   {repr(think_end_tag)}")
+
+        # Decode target to find thinking blocks (text-based approach to handle tokenization boundaries)
+        target_text = self.tokenizer.decode(target_ids, skip_special_tokens=False)
+        print(f"\nFull target sequence: {target_text}")
+        print("="*80 + "\n")
+
+        # Find all thinking blocks in the text
+        import re
+        pattern = re.escape(think_start_tag) + r"(.*?)" + re.escape(think_end_tag)
+        matches = list(re.finditer(pattern, target_text, flags=re.DOTALL))
+
+        print(f"DEBUG: Found {len(matches)} thinking block(s) in text")
+
+        # Create mutable copy of labels
+        masked_label = list(target_label)
+
+        if len(matches) == 0:
+            return masked_label
+
+        # Build character-to-token mapping
+        char_to_token = []
+        char_pos = 0
+        for token_idx, token_id in enumerate(target_ids):
+            token_text = self.tokenizer.decode([token_id], skip_special_tokens=False)
+            token_len = len(token_text)
+            char_to_token.extend([token_idx] * token_len)
+            char_pos += token_len
+
+        print("DEBUG: Scanning for thinking tags...")
+
+        # Mask tokens corresponding to thinking blocks
+        for match_idx, match in enumerate(matches):
+            start_char = match.start()
+            end_char = match.end()
+
+            print(f"  ✓ Match {match_idx + 1}: chars {start_char}-{end_char}")
+            print(f"    → Content: {repr(target_text[start_char:end_char][:100])}...")
+
+            # Convert character positions to token positions
+            if start_char < len(char_to_token) and end_char <= len(char_to_token):
+                start_token_idx = char_to_token[start_char] if start_char < len(char_to_token) else 0
+                end_token_idx = char_to_token[end_char - 1] if end_char > 0 and end_char - 1 < len(char_to_token) else len(target_ids) - 1
+
+                print(f"    → Token range: {start_token_idx}-{end_token_idx}")
+
+                # Mask all tokens in this range
+                for idx in range(start_token_idx, end_token_idx + 1):
+                    if idx < len(masked_label):
+                        masked_label[idx] = IGNORE_INDEX
+
+        print()
+        return masked_label
+
+    def _match_sequence(
+        self,
+        ids: list[int],
+        start_idx: int,
+        pattern: list[int]
+    ) -> bool:
+        """
+        Check if a pattern of token IDs matches the sequence at a given position.
+
+        Args:
+            ids: Full sequence of token IDs to search in
+            start_idx: Position to start matching from
+            pattern: Sequence of token IDs to match
+
+        Returns:
+            True if pattern matches at start_idx, False otherwise
+        """
+        # Check bounds
+        if start_idx + len(pattern) > len(ids):
+            return False
+
+        # Compare sequences
+        return ids[start_idx:start_idx + len(pattern)] == pattern
 
 
 @dataclass
